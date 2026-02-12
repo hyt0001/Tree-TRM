@@ -1,0 +1,33 @@
+name: "recursive_reasoning.tree_trm@TreeRecursiveReasoningModel"
+
+# Tree Config
+tree_branching_factor: 4
+
+# Transformer config
+hidden_size: 256
+expansion: 1.5
+num_heads: 4
+pos_encodings: "rope"
+
+# Reasoning config
+H_layers: 0 # Ignored in TRM, but kept for compatibility
+L_layers: 2 # Layers per reasoning step
+H_cycles: 3 # Tree depth
+L_cycles: 4 # Processing per node
+
+# Halting config
+halt_max_steps: 12
+halt_exploration_prob: 0.05
+
+# Loss config
+loss:
+  name: "losses@ACTLossHead"
+  loss_type: "softmax_cross_entropy"
+
+# Puzzle Embedding
+puzzle_emb_ndim: 0
+num_puzzle_identifiers: 0
+
+# Extras
+mlp_t: False
+no_ACT_continue: True

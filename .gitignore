@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+venv/
+.env
+
+# Data and Models
+data/
+data_source/
+checkpoints/
+wandb/
+outputs/
+*.pt
+*.pth
+*.npy
+*.csv
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/
+data_source/
+checkpoints/
+wandb/
+*.log
+packages/
