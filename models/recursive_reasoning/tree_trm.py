@@ -159,8 +159,18 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
             trunc_normal_init_(torch.empty(self.config.tree_branching_factor, self.config.hidden_size), std=0.02)
         )
         
-        # Branch Projector: Projects current state to K keys for selection
-        self.branch_key_proj = CastedLinear(self.config.hidden_size, self.config.tree_branching_factor * self.config.hidden_size, bias=False)
+        # Chunk Encoder (for LongBench context chunks)
+        # Assuming simple projection for now, but could be a small Transformer
+        self.chunk_encoder = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
+
+        # Cross Attention Projections for Branch Selection
+        self.ca_q_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
+        self.ca_k_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
+        self.ca_v_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
+        self.ca_o_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
+        
+        # Branch Predictor: Projects context-aware state to K logits
+        self.branch_pred_head = CastedLinear(self.config.hidden_size, self.config.tree_branching_factor, bias=False)
 
 
         # Initial states
@@ -176,8 +186,55 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
 
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
+        # Puzzle embeddings (or Context Chunks)
+        if puzzle_identifiers.ndim == 3: # [Batch, NumChunks, ChunkLen] -> Context Chunks Mode
+            # 1. Embed tokens
+            # [Batch, NumChunks, ChunkLen, Hidden]
+            chunk_embeds = self.embed_tokens(puzzle_identifiers.to(torch.int32)) 
+            
+            # 2. Encode chunks into vectors
+            # Simple Mean Pooling: [Batch, NumChunks, Hidden]
+            chunk_vectors = chunk_embeds.mean(dim=2) 
+            
+            # 3. Project
+            puzzle_embedding = self.chunk_encoder(chunk_vectors)
+            
+            # Note: In this mode, we don't concatenate puzzle_embedding to input embedding sequence directly
+            # because puzzle_embedding is used as Key/Value Memory for Cross-Attention selection.
+            # However, to keep compatibility with existing code structure that expects a combined sequence,
+            # we might need to adjust.
+            
+            # Strategy: 
+            # - Input Embedding is just the Query (Question).
+            # - Puzzle Embedding is the Context Memory.
+            # - The model expects `_input_embeddings` to return a single sequence.
+            # - BUT, for Tree-TRM logic, we usually concat [Puzzle_Emb, Input_Emb].
+            
+            # Let's check `forward` method... it uses `input_embeddings` for L_level processing.
+            # And `select_next_node` uses `z` which comes from L_level.
+            
+            # For LongBench RAG mode, we want:
+            # - z (Latent State) to evolve.
+            # - select_next_node to look at `puzzle_embedding` (Context Chunks) using `z` as query?
+            # Wait, the current `select_next_node` uses `input_query` (from input) as Q, and `z` as K/V.
+            
+            # REVISION for RAG:
+            # - We need `z` (State) to be Q.
+            # - We need `Context Chunks` to be K/V.
+            # - Then we select a chunk, and add it to `z`.
+            
+            # Let's strictly follow the existing interface but adapt usage.
+            # We return `embedding` (Question) as the main sequence.
+            # We store `puzzle_embedding` (Contexts) in a temporary way or just return it?
+            # The current function signature returns only one tensor.
+            
+            # Hack: We attach puzzle_embedding to the module state temporarily? No, that's bad for DP.
+            # Better: We assume this function returns the Question Embedding.
+            # And we handle Context Chunks separately in forward.
+            
+            return self.embed_scale * embedding, puzzle_embedding # Return tuple! (Need to update call site)
+
+        elif self.config.puzzle_emb_ndim > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
@@ -187,8 +244,7 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
             # Fix: ensure puzzle embedding is reshaped correctly for concatenation
             puzzle_embedding = puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size)
         else:
-            # Fallback: if no puzzle embedding is used, we still need to prepend tokens 
-            # to match the carry size (seq_len + puzzle_emb_len)
+            # Fallback
             puzzle_embedding = torch.zeros(
                 (input.shape[0], self.puzzle_emb_len, self.config.hidden_size),
                 dtype=embedding.dtype,
@@ -196,8 +252,6 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
             )
         
         # Concatenate puzzle embedding (prefix) with token embedding
-        # puzzle_embedding: [Batch, puzzle_emb_len, Hidden]
-        # embedding: [Batch, SeqLen, Hidden]
         embedding = torch.cat((puzzle_embedding, embedding), dim=1)  # Concat along sequence dim (dim=1)
 
         # Position embeddings
@@ -206,7 +260,7 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
         # Scale
-        return self.embed_scale * embedding
+        return self.embed_scale * embedding, None # Return tuple matching new signature
 
     def empty_carry(self, batch_size: int):
         return TreeRecursiveReasoningModel_InnerCarry(
@@ -220,36 +274,80 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def select_next_node(self, input_query: torch.Tensor, z: torch.Tensor):
+    def select_next_node(self, input_query: torch.Tensor, z: torch.Tensor, context_memory: Optional[torch.Tensor] = None):
         """
-        Selects the best next 'child node' based on query relevance.
-        input_query: [Batch, Hidden] - The pooled input serving as query
-        z: [Batch, SeqLen, Hidden] - Current latent state
+        Selects the best next 'child node' based on query relevance using Cross-Attention.
+        input_query: [Batch, Hidden] - The pooled input serving as query (Q)
+        z: [Batch, SeqLen, Hidden] - Current latent state 
+        context_memory: [Batch, NumChunks, Hidden] - Optional external memory (for LongBench RAG)
         """
         batch_size = z.shape[0]
         
-        # 1. Generate keys for K potential children from current z
-        # We pool z to get a summary vector for routing
-        z_pooled = z.mean(dim=1) # [Batch, Hidden]
+        # Determine Q, K, V source
+        if context_memory is not None:
+            # RAG Mode: 
+            # Q = Current State Summary (z_pooled) or Input Query? 
+            # We want to select a chunk relevant to current reasoning state AND original question.
+            # Let's use (Query + State) as Q.
+            z_pooled = z.mean(dim=1)
+            q_input = input_query + z_pooled
+            
+            # K, V = Context Memory (Chunks)
+            k_input = context_memory
+            v_input = context_memory
+            
+            # We need to project context_memory to branch_embeddings space?
+            # Or simpler: The "Output" of this selection is the selected Chunk Vector itself.
+            pass
+        else:
+            # Standard Tree-TRM Mode
+            q_input = input_query
+            k_input = z
+            v_input = z
+
+        # 1. Project Q, K, V
+        # Q: [Batch, 1, Hidden]
+        q = self.ca_q_proj(q_input).unsqueeze(1)
         
-        # Generate K keys: [Batch, K, Hidden]
-        branch_keys = self.branch_key_proj(z_pooled).view(batch_size, self.config.tree_branching_factor, self.config.hidden_size)
+        # K, V: [Batch, SeqLen/NumChunks, Hidden]
+        k = self.ca_k_proj(k_input)
+        v = self.ca_v_proj(v_input)
         
-        # 2. Compute attention scores with Query (Input)
-        # Query: [Batch, 1, Hidden]
-        query = input_query.unsqueeze(1)
+        # 2. Multi-head Cross Attention
+        # Reshape for multi-head: [Batch, SeqLen, NumHeads, HeadDim]
+        head_dim = self.config.hidden_size // self.config.num_heads
         
-        # Scores: [Batch, 1, K] -> [Batch, K]
-        # Dot product attention
-        scores = torch.bmm(query, branch_keys.transpose(1, 2)).squeeze(1)
-        scores = scores / math.sqrt(self.config.hidden_size)
+        q = q.view(batch_size, 1, self.config.num_heads, head_dim).transpose(1, 2) # [B, H, 1, D]
+        k = k.view(batch_size, -1, self.config.num_heads, head_dim).transpose(1, 2) # [B, H, S, D]
+        v = v.view(batch_size, -1, self.config.num_heads, head_dim).transpose(1, 2) # [B, H, S, D]
         
-        # 3. Select best branch
-        best_branch_idx = torch.argmax(scores, dim=-1) # [Batch]
+        # Scaled Dot Product Attention
+        # Output: [B, H, 1, D]
+        attn_output = F.scaled_dot_product_attention(q, k, v)
         
-        # 4. Get the corresponding branch embedding to add to z
-        # self.branch_embeddings: [K, Hidden]
-        selected_branch_emb = self.branch_embeddings[best_branch_idx] # [Batch, Hidden]
+        # Merge heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, self.config.hidden_size)
+        
+        # Output projection
+        context_vector = self.ca_o_proj(attn_output).squeeze(1) # [Batch, Hidden]
+        
+        if context_memory is not None:
+            # RAG Mode: The context_vector itself IS the retrieved information!
+            # But to keep consistent with "branch embedding" logic (adding to z),
+            # we can return it directly.
+            # Also, we might want to know WHICH chunk was selected (for interpretability), 
+            # but for now let's just use the soft-attended vector.
+            selected_branch_emb = context_vector
+        else:
+            # 3. Predict best branch from context vector
+            # logits: [Batch, K]
+            logits = self.branch_pred_head(context_vector)
+            
+            # 4. Select best branch
+            best_branch_idx = torch.argmax(logits, dim=-1) # [Batch]
+            
+            # 5. Get the corresponding branch embedding to add to z
+            selected_branch_emb = self.branch_embeddings[best_branch_idx] # [Batch, Hidden]
         
         return selected_branch_emb
 
@@ -259,7 +357,9 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
         )
 
         # Input Embeddings
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        # Note: _input_embeddings returns a tuple (embedding, context_memory)
+        # where context_memory is only present in RAG mode (LongBench)
+        input_embeddings, context_memory = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
         
         # Compute Query from Input (Global Average Pooling) to serve as the fixed "User Query"
         # We exclude the puzzle_emb part for query if needed, or keep it. Let's keep it.
@@ -290,7 +390,7 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
         with torch.no_grad():
             for _H_step in range(no_grad_cycles):
                 # 1. Selection Phase
-                branch_emb = self.select_next_node(query_vector, z_H) # [Batch, Hidden]
+                branch_emb = self.select_next_node(query_vector, z_H, context_memory=context_memory) # [Batch, Hidden]
                 
                 # 2. Update z_H to "child" (add branch embedding broadcasting over SeqLen)
                 z_H_child = z_H + branch_emb.unsqueeze(1)
@@ -304,7 +404,7 @@ class TreeRecursiveReasoningModel_Inner(nn.Module):
         # Grad Phase
         for _H_step in range(grad_cycles):
              # 1. Selection Phase
-            branch_emb = self.select_next_node(query_vector, z_H)
+            branch_emb = self.select_next_node(query_vector, z_H, context_memory=context_memory)
             
             # 2. Update z_H to "child"
             z_H_child = z_H + branch_emb.unsqueeze(1)
